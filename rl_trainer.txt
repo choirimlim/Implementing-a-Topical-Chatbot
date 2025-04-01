@@ -1,0 +1,387 @@
+"""
+RL Trainer module for the DocuChat application.
+Implements Group Relative Policy Optimization (GRPO) for training.
+"""
+
+import os
+import logging
+import yaml
+import json
+import time
+import torch
+import numpy as np
+from typing import List, Dict, Any, Optional, Tuple, Union
+from tqdm import tqdm
+from datetime import datetime
+import random
+
+from transformers import TrainingArguments, AutoTokenizer, StoppingCriteria, StoppingCriteriaList
+from peft import PeftModel
+
+logger = logging.getLogger(__name__)
+
+class GRPOTrainer:
+    """
+    Implements Group Relative Policy Optimization (GRPO) for training LLMs.
+    Inspired by the approach from "Reinforcement Learning for Reasoning in Small LLMs".
+    """
+    
+    def __init__(
+        self, 
+        model, 
+        tokenizer, 
+        reward_model,
+        config_path: str = "config/config.yaml",
+        output_dir: Optional[str] = None
+    ):
+        """
+        Initialize the GRPO trainer.
+        
+        Args:
+            model: Pre-trained language model
+            tokenizer: Tokenizer for the model
+            reward_model: Reward model instance
+            config_path: Path to the configuration file
+            output_dir: Directory to save training outputs
+        """
+        with open(config_path, 'r') as f:
+            self.config = yaml.safe_load(f)
+        
+        self.model = model
+        self.tokenizer = tokenizer
+        self.reward_model = reward_model
+        
+        # Set up output directory
+        self.output_dir = output_dir or os.path.join("data", "trained_models", f"grpo_{int(time.time())}")
+        os.makedirs(self.output_dir, exist_ok=True)
+        
+        # Load training hyperparameters
+        self.batch_size = self.config['rl']['training']['per_device_train_batch_size']
+        self.learning_rate = self.config['rl']['training']['learning_rate']
+        self.num_epochs = self.config['rl']['training']['num_train_epochs']
+        self.max_steps = self.config['rl']['training']['max_steps']
+        self.num_generations = self.config['rl']['generation']['num_generations']
+        self.max_new_tokens = self.config['model']['max_new_tokens']
+        self.temperature = self.config['rl']['generation']['temperature']
+        
+        # Initialize W&B if enabled
+        self.wandb_enabled = self.config['wandb']['enabled']
+        if self.wandb_enabled:
+            self._setup_wandb()
+        
+        logger.info(f"Initialized GRPOTrainer with batch_size={self.batch_size}, lr={self.learning_rate}")
+    
+    def _setup_wandb(self):
+        """Set up Weights & Biases for tracking training."""
+        try:
+            import wandb
+            wandb.init(
+                project=self.config['wandb']['project'],
+                entity=self.config['wandb']['entity'],
+                config={
+                    "model": self.config['model']['base_model_name'],
+                    "batch_size": self.batch_size,
+                    "learning_rate": self.learning_rate,
+                    "num_epochs": self.num_epochs,
+                    "max_steps": self.max_steps,
+                    "num_generations": self.num_generations,
+                    "algorithm": "GRPO"
+                }
+            )
+            self.wandb = wandb
+            logger.info("Initialized Weights & Biases tracking")
+        except ImportError:
+            logger.warning("wandb not installed. Disabling W&B tracking.")
+            self.wandb_enabled = False
+    
+    def generate_group_outputs(self, prompt: str, reference_output: Optional[str] = None) -> List[str]:
+        """
+        Generate a group of outputs for a single prompt for GRPO training.
+        
+        Args:
+            prompt: Input prompt
+            reference_output: Reference output for KL regularization (optional)
+            
+        Returns:
+            List of generated text outputs
+        """
+        outputs = []
+        
+        # Tokenize prompt
+        input_ids = self.tokenizer(prompt, return_tensors="pt").input_ids
+        if torch.cuda.is_available():
+            input_ids = input_ids.cuda()
+        
+        # Generate multiple outputs
+        for _ in range(self.num_generations):
+            with torch.no_grad():
+                output = self.model.generate(
+                    input_ids,
+                    max_new_tokens=self.max_new_tokens,
+                    temperature=self.temperature,
+                    do_sample=True,
+                    top_p=0.9,
+                    pad_token_id=self.tokenizer.pad_token_id,
+                )
+            
+            # Decode output (skip input prompt tokens)
+            decoded_output = self.tokenizer.decode(output[0][input_ids.size(1):], skip_special_tokens=True)
+            outputs.append(decoded_output)
+        
+        return outputs
+    
+    def calculate_advantages(self, rewards: List[float]) -> List[float]:
+        """
+        Calculate advantage values for GRPO from a group of rewards.
+        
+        Args:
+            rewards: List of rewards for each output in the group
+            
+        Returns:
+            List of advantages
+        """
+        if not rewards:
+            return []
+        
+        # Calculate mean and std for the group
+        mean_reward = sum(rewards) / len(rewards)
+        
+        # Calculate standard deviation (with epsilon for numerical stability)
+        sq_diff = [(r - mean_reward) ** 2 for r in rewards]
+        variance = sum(sq_diff) / len(rewards)
+        std_reward = max(np.sqrt(variance), 1e-8)  # Avoid division by zero
+        
+        # Calculate normalized advantages
+        advantages = [(r - mean_reward) / std_reward for r in rewards]
+        
+        return advantages
+    
+    def train_step(self, prompt: str, expected_answer: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Perform a single GRPO training step.
+        
+        Args:
+            prompt: Input prompt
+            expected_answer: Expected answer for reward calculation (optional)
+            
+        Returns:
+            Dictionary with training metrics
+        """
+        # Generate a group of outputs
+        outputs = self.generate_group_outputs(prompt)
+        
+        # Calculate rewards for each output
+        rewards = [self.reward_model.calculate_combined_reward(output, expected_answer) for output in outputs]
+        
+        # Calculate advantages
+        advantages = self.calculate_advantages(rewards)
+        
+        # Create input and output tensors for all outputs in the group
+        all_input_ids = []
+        all_attention_masks = []
+        all_labels = []
+        all_advantages = []
+        
+        for output, advantage in zip(outputs, advantages):
+            # Tokenize the full prompt + output sequence
+            full_sequence = prompt + output
+            tokenized = self.tokenizer(full_sequence, truncation=True, max_length=2048, return_tensors="pt")
+            
+            prompt_tokens = self.tokenizer(prompt, return_tensors="pt")
+            prompt_length = prompt_tokens.input_ids.size(1)
+            
+            # Set labels to -100 for prompt tokens (we don't want to compute loss on them)
+            labels = tokenized.input_ids.clone()
+            labels[:, :prompt_length] = -100
+            
+            all_input_ids.append(tokenized.input_ids)
+            all_attention_masks.append(tokenized.attention_mask)
+            all_labels.append(labels)
+            all_advantages.append(torch.tensor([advantage]))
+        
+        # Concatenate all tensors
+        batch_input_ids = torch.cat(all_input_ids)
+        batch_attention_masks = torch.cat(all_attention_masks)
+        batch_labels = torch.cat(all_labels)
+        batch_advantages = torch.cat(all_advantages)
+        
+        if torch.cuda.is_available():
+            batch_input_ids = batch_input_ids.cuda()
+            batch_attention_masks = batch_attention_masks.cuda()
+            batch_labels = batch_labels.cuda()
+            batch_advantages = batch_advantages.cuda()
+        
+        # Train the model with GRPO
+        outputs = self.model(
+            input_ids=batch_input_ids,
+            attention_mask=batch_attention_masks,
+            labels=batch_labels,
+            # We'll implement custom handling of advantages
+        )
+        
+        loss = outputs.loss
+        
+        # Compute KL penalty and GRPO loss here
+        # Note: This is a simplified version of GRPO
+        # A more complete implementation would include clipping, KL regularization, etc.
+        
+        # For simplicity, we just weight the loss by advantages
+        weighted_loss = (loss * batch_advantages).mean()
+        
+        # Backpropagate
+        weighted_loss.backward()
+        
+        # Return metrics
+        metrics = {
+            "loss": loss.item(),
+            "weighted_loss": weighted_loss.item(),
+            "rewards": rewards,
+            "advantages": advantages,
+        }
+        
+        return metrics
+    
+    def train(self, dataset, optimizer, scheduler=None) -> Dict[str, Any]:
+        """
+        Train the model using GRPO on the given dataset.
+        
+        Args:
+            dataset: Training dataset
+            optimizer: Optimizer for model parameters
+            scheduler: Learning rate scheduler (optional)
+            
+        Returns:
+            Dictionary with training metrics
+        """
+        # Set model to training mode
+        self.model.train()
+        
+        # Initialize progress tracker
+        progress_bar = tqdm(total=min(len(dataset), self.max_steps), desc="Training")
+        
+        # Initialize metrics
+        metrics = {
+            "loss": [],
+            "reward": [],
+            "steps": 0,
+        }
+        
+        # Perform training
+        step = 0
+        
+        for epoch in range(self.num_epochs):
+            epoch_loss = 0.0
+            epoch_reward = 0.0
+            samples_processed = 0
+            
+            # Shuffle dataset
+            random.shuffle(dataset)
+            
+            for i, example in enumerate(dataset):
+                # Extract prompt and expected answer
+                prompt = example["prompt"]
+                expected_answer = example.get("answer")
+                
+                # Perform training step
+                step_metrics = self.train_step(prompt, expected_answer)
+                
+                # Update optimizer
+                optimizer.step()
+                optimizer.zero_grad()
+                
+                # Update scheduler if provided
+                if scheduler:
+                    scheduler.step()
+                
+                # Update metrics
+                epoch_loss += step_metrics["loss"]
+                epoch_reward += sum(step_metrics["rewards"]) / len(step_metrics["rewards"])
+                samples_processed += 1
+                
+                # Log to W&B if enabled
+                if self.wandb_enabled and (i + 1) % 10 == 0:
+                    self.wandb.log({
+                        "loss": step_metrics["loss"],
+                        "weighted_loss": step_metrics["weighted_loss"],
+                        "reward_mean": sum(step_metrics["rewards"]) / len(step_metrics["rewards"]),
+                        "reward_max": max(step_metrics["rewards"]),
+                        "reward_min": min(step_metrics["rewards"]),
+                        "advantage_mean": sum(step_metrics["advantages"]) / len(step_metrics["advantages"]),
+                        "advantage_max": max(step_metrics["advantages"]),
+                        "advantage_min": min(step_metrics["advantages"]),
+                        "step": step,
+                        "epoch": epoch,
+                    })
+                
+                # Update progress
+                progress_bar.update(1)
+                progress_bar.set_postfix({
+                    "loss": f"{step_metrics['loss']:.4f}",
+                    "reward": f"{sum(step_metrics['rewards']) / len(step_metrics['rewards']):.4f}",
+                    "epoch": epoch + 1,
+                })
+                
+                step += 1
+                metrics["steps"] = step
+                
+                # Save checkpoint every 50 steps
+                if step % 50 == 0:
+                    self._save_checkpoint(step)
+                
+                # Check if max steps reached
+                if step >= self.max_steps:
+                    break
+            
+            # Compute epoch metrics
+            if samples_processed > 0:
+                avg_epoch_loss = epoch_loss / samples_processed
+                avg_epoch_reward = epoch_reward / samples_processed
+                
+                metrics["loss"].append(avg_epoch_loss)
+                metrics["reward"].append(avg_epoch_reward)
+                
+                logger.info(f"Epoch {epoch+1}/{self.num_epochs}: loss={avg_epoch_loss:.4f}, reward={avg_epoch_reward:.4f}")
+            
+            # Check if max steps reached
+            if step >= self.max_steps:
+                logger.info(f"Reached maximum steps ({self.max_steps}). Stopping training.")
+                break
+        
+        # Close progress bar
+        progress_bar.close()
+        
+        # Save final model
+        self._save_checkpoint("final")
+        
+        return metrics
+    
+    def _save_checkpoint(self, step):
+        """Save a model checkpoint."""
+        checkpoint_dir = os.path.join(self.output_dir, f"checkpoint-{step}")
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        
+        logger.info(f"Saving checkpoint to {checkpoint_dir}")
+        
+        # Check if using PEFT/LoRA
+        if isinstance(self.model, PeftModel):
+            # Save adapter weights
+            self.model.save_pretrained(checkpoint_dir)
+            # Save tokenizer
+            self.tokenizer.save_pretrained(checkpoint_dir)
+        else:
+            # Save full model
+            self.model.save_pretrained(checkpoint_dir)
+            # Save tokenizer
+            self.tokenizer.save_pretrained(checkpoint_dir)
+        
+        # Save training configuration
+        with open(os.path.join(checkpoint_dir, "training_config.json"), 'w') as f:
+            json.dump({
+                "learning_rate": self.learning_rate,
+                "batch_size": self.batch_size,
+                "num_epochs": self.num_epochs,
+                "max_steps": self.max_steps,
+                "num_generations": self.num_generations,
+                "step": step,
+                "timestamp": datetime.now().strftime("%Y-%m-%d-%H-%M-%S"),
+            }, f, indent=2)

@@ -1,0 +1,40 @@
+```
+docuchat/
+├── README.md               # Project documentation
+├── requirements.txt        # Dependencies
+├── setup.py                # Package installation
+├── .gitignore              # Git ignore file
+├── config/
+│   └── config.yaml         # Configuration file
+├── data/
+│   ├── documents/          # Where user documents are stored
+│   └── processed/          # Processed document embeddings
+├── docuchat/
+│   ├── __init__.py
+│   ├── core/
+│   │   ├── __init__.py
+│   │   ├── model_loader.py       # Loads LLM models
+│   │   ├── document_processor.py # Processes documents
+│   │   ├── embeddings.py         # Handles vector embeddings
+│   │   ├── retriever.py          # Retrieves relevant context
+│   │   └── reward_model.py       # RL reward models
+│   ├── training/
+│   │   ├── __init__.py
+│   │   ├── rl_trainer.py         # RL training implementation
+│   │   └── data_handler.py       # Training data management
+│   ├── api/
+│   │   ├── __init__.py
+│   │   └── routes.py             # API endpoints
+│   └── ui/
+│       ├── __init__.py
+│       ├── app.py                # Streamlit UI
+│       └── components.py         # UI components
+├── scripts/
+│   ├── train_model.py            # Training script
+│   └── evaluate_model.py         # Evaluation script
+└── tests/
+    ├── __init__.py
+    ├── test_document_processor.py
+    ├── test_retriever.py
+    └── test_reward_model.py
+```

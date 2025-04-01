@@ -1,0 +1,493 @@
+"""
+API routes for the DocuChat application.
+Provides endpoints for document management, chat, and training.
+"""
+
+import os
+import logging
+import yaml
+import json
+import time
+from typing import List, Dict, Any, Optional
+from datetime import datetime
+import uuid
+
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, BackgroundTasks, Query, Body
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+
+# Import DocuChat components
+from docuchat.core.document_processor import DocumentProcessor
+from docuchat.core.embeddings import DocumentEmbeddings
+from docuchat.core.retriever import DocumentRetriever
+from docuchat.core.model_loader import ModelLoader
+from docuchat.core.reward_model import RewardModel
+from docuchat.training.data_handler import DataHandler
+
+# Configure logging
+logger = logging.getLogger(__name__)
+
+# Load configuration
+with open("config/config.yaml", 'r') as f:
+    config = yaml.safe_load(f)
+
+# Initialize components
+model_loader = ModelLoader()
+document_processor = DocumentProcessor()
+embedding_model = model_loader.load_embedding_model()
+embeddings = DocumentEmbeddings(embedding_model)
+retriever = DocumentRetriever(embeddings)
+reward_model = RewardModel()
+data_handler = DataHandler()
+
+# Load model and tokenizer for inference
+model, tokenizer = model_loader.load_model_and_tokenizer()
+
+# Create FastAPI app
+app = FastAPI(
+    title="DocuChat API",
+    description="API for document-based chatbot with RL capabilities",
+    version="0.1.0"
+)
+
+# Configure CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[config['api']['cors_origin']],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Define API models
+class MessageRequest(BaseModel):
+    """Model for chat message request."""
+    query: str = Field(..., description="User query or message")
+    conversation_id: Optional[str] = Field(None, description="Conversation ID")
+    max_new_tokens: Optional[int] = Field(None, description="Maximum new tokens to generate")
+    include_context: Optional[bool] = Field(False, description="Include retrieved context in response")
+
+class MessageResponse(BaseModel):
+    """Model for chat message response."""
+    response: str = Field(..., description="Assistant response")
+    conversation_id: str = Field(..., description="Conversation ID")
+    context: Optional[str] = Field(None, description="Retrieved context if requested")
+    processing_time: float = Field(..., description="Processing time in seconds")
+
+class DocumentResponse(BaseModel):
+    """Model for document processing response."""
+    document_id: str = Field(..., description="Document ID")
+    filename: str = Field(..., description="Original filename")
+    chunk_count: int = Field(..., description="Number of chunks")
+    status: str = Field(..., description="Processing status")
+
+class FeedbackRequest(BaseModel):
+    """Model for user feedback."""
+    conversation_id: str = Field(..., description="Conversation ID")
+    message_id: str = Field(..., description="Message ID")
+    rating: int = Field(..., description="Rating (1-5)")
+    feedback_text: Optional[str] = Field(None, description="Optional feedback text")
+
+class TrainingRequest(BaseModel):
+    """Model for training request."""
+    model_name: str = Field(..., description="Model name to train")
+    max_steps: Optional[int] = Field(None, description="Maximum training steps")
+    learning_rate: Optional[float] = Field(None, description="Learning rate")
+
+class TrainingResponse(BaseModel):
+    """Model for training response."""
+    training_id: str = Field(..., description="Training job ID")
+    status: str = Field(..., description="Training status")
+    model_name: str = Field(..., description="Model name")
+
+
+# API routes
+@app.get("/")
+async def root():
+    """Health check endpoint."""
+    return {"status": "healthy", "version": "0.1.0"}
+
+@app.post("/documents/upload", response_model=DocumentResponse)
+async def upload_document(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    document_id: Optional[str] = Form(None)
+):
+    """
+    Upload and process a document.
+    
+    Args:
+        file: Document file
+        document_id: Optional document ID (generated if not provided)
+        
+    Returns:
+        Document information including ID and status
+    """
+    # Generate document ID if not provided
+    doc_id = document_id or f"doc_{uuid.uuid4().hex[:10]}"
+    
+    # Save uploaded file temporarily
+    file_path = f"data/documents/{file.filename}"
+    
+    try:
+        # Save the file
+        with open(file_path, "wb") as f:
+            f.write(await file.read())
+        
+        # Process the document asynchronously
+        background_tasks.add_task(process_document, file_path, doc_id)
+        
+        return DocumentResponse(
+            document_id=doc_id,
+            filename=file.filename,
+            chunk_count=0,  # Will be updated during processing
+            status="processing"
+        )
+    
+    except Exception as e:
+        logger.error(f"Error uploading document: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Document upload failed: {str(e)}")
+
+async def process_document(file_path: str, doc_id: str):
+    """
+    Process a document in the background.
+    
+    Args:
+        file_path: Path to the document file
+        doc_id: Document ID
+    """
+    try:
+        # Process the document
+        chunks, metadata = document_processor.process_document(file_path)
+        
+        # Add processing timestamp
+        metadata["processed_date"] = datetime.now().isoformat()
+        
+        # Save processed document
+        document_processor.save_processed_document(doc_id, chunks, metadata)
+        
+        # Add document chunks to embeddings
+        embeddings.add_document_chunks(doc_id, chunks, metadata)
+        
+        logger.info(f"Document {doc_id} processed successfully with {len(chunks)} chunks")
+    
+    except Exception as e:
+        logger.error(f"Error processing document {doc_id}: {str(e)}")
+
+@app.get("/documents", response_model=List[Dict[str, Any]])
+async def list_documents():
+    """
+    List all processed documents.
+    
+    Returns:
+        List of document metadata
+    """
+    doc_list = []
+    docs_dir = "data/processed/documents"
+    
+    if not os.path.exists(docs_dir):
+        return []
+    
+    for doc_id in os.listdir(docs_dir):
+        metadata_path = os.path.join(docs_dir, doc_id, "metadata.json")
+        
+        if os.path.exists(metadata_path):
+            try:
+                with open(metadata_path, 'r') as f:
+                    metadata = json.load(f)
+                
+                doc_info = {
+                    "document_id": doc_id,
+                    **metadata
+                }
+                
+                doc_list.append(doc_info)
+            
+            except Exception as e:
+                logger.error(f"Error loading document metadata for {doc_id}: {str(e)}")
+    
+    return doc_list
+
+@app.delete("/documents/{document_id}")
+async def delete_document(document_id: str):
+    """
+    Delete a document from the system.
+    
+    Args:
+        document_id: Document ID to delete
+        
+    Returns:
+        Status message
+    """
+    try:
+        # Remove from embeddings
+        removed = embeddings.remove_document(document_id)
+        
+        if not removed:
+            raise HTTPException(status_code=404, detail=f"Document {document_id} not found")
+        
+        # Remove processed files
+        doc_dir = f"data/processed/documents/{document_id}"
+        if os.path.exists(doc_dir):
+            import shutil
+            shutil.rmtree(doc_dir)
+        
+        return {"status": "success", "message": f"Document {document_id} deleted"}
+    
+    except HTTPException:
+        raise
+    
+    except Exception as e:
+        logger.error(f"Error deleting document {document_id}: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error deleting document: {str(e)}")
+
+@app.post("/chat", response_model=MessageResponse)
+async def chat(message: MessageRequest):
+    """
+    Process a chat message with document retrieval.
+    
+    Args:
+        message: User message request
+        
+    Returns:
+        Assistant response with optional context
+    """
+    start_time = time.time()
+    
+    try:
+        # Generate or use conversation ID
+        conversation_id = message.conversation_id or f"conv_{uuid.uuid4().hex[:10]}"
+        
+        # Retrieve relevant context
+        context = retriever.retrieve_and_format(message.query)
+        
+        # Create prompt with context
+        prompt = data_handler.create_training_prompt(message.query, context)
+        
+        # Set generation parameters
+        max_new_tokens = message.max_new_tokens or config['model']['max_new_tokens']
+        
+        # Generate response
+        input_ids = tokenizer(prompt, return_tensors="pt").input_ids
+        if torch.cuda.is_available():
+            input_ids = input_ids.cuda()
+        
+        with torch.no_grad():
+            output = model.generate(
+                input_ids,
+                max_new_tokens=max_new_tokens,
+                temperature=config['model']['temperature'],
+                top_p=config['model']['top_p'],
+                pad_token_id=tokenizer.pad_token_id,
+            )
+        
+        # Decode output (skip input prompt tokens)
+        response = tokenizer.decode(output[0][input_ids.size(1):], skip_special_tokens=True)
+        
+        # Calculate processing time
+        processing_time = time.time() - start_time
+        
+        # Create response
+        chat_response = MessageResponse(
+            response=response,
+            conversation_id=conversation_id,
+            processing_time=processing_time,
+            context=context if message.include_context else None
+        )
+        
+        return chat_response
+    
+    except Exception as e:
+        logger.error(f"Error processing chat message: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Chat processing failed: {str(e)}")
+
+@app.post("/feedback", response_model=Dict[str, Any])
+async def submit_feedback(feedback: FeedbackRequest):
+    """
+    Submit user feedback for a message.
+    Feedback is used to improve the model via RL.
+    
+    Args:
+        feedback: User feedback
+        
+    Returns:
+        Status message
+    """
+    try:
+        # Validate rating
+        if not 1 <= feedback.rating <= 5:
+            raise HTTPException(status_code=400, detail="Rating must be between 1 and 5")
+        
+        # Save feedback to database or file
+        feedback_dir = "data/feedback"
+        os.makedirs(feedback_dir, exist_ok=True)
+        
+        feedback_file = os.path.join(feedback_dir, f"{feedback.conversation_id}_{feedback.message_id}.json")
+        
+        with open(feedback_file, 'w') as f:
+            json.dump({
+                "conversation_id": feedback.conversation_id,
+                "message_id": feedback.message_id,
+                "rating": feedback.rating,
+                "feedback_text": feedback.feedback_text,
+                "timestamp": datetime.now().isoformat()
+            }, f, indent=2)
+        
+        return {
+            "status": "success",
+            "message": "Feedback received successfully"
+        }
+    
+    except HTTPException:
+        raise
+    
+    except Exception as e:
+        logger.error(f"Error saving feedback: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error saving feedback: {str(e)}")
+
+@app.post("/train", response_model=TrainingResponse)
+async def start_training(background_tasks: BackgroundTasks, request: TrainingRequest):
+    """
+    Start training the model with collected data and feedback.
+    
+    Args:
+        request: Training request
+        
+    Returns:
+        Training job information
+    """
+    try:
+        # Generate training ID
+        training_id = f"train_{uuid.uuid4().hex[:10]}"
+        
+        # Override config with request parameters
+        if request.max_steps:
+            config['rl']['training']['max_steps'] = request.max_steps
+        
+        if request.learning_rate:
+            config['rl']['training']['learning_rate'] = request.learning_rate
+        
+        # Start training in background
+        background_tasks.add_task(
+            train_model_background,
+            training_id=training_id,
+            model_name=request.model_name
+        )
+        
+        return TrainingResponse(
+            training_id=training_id,
+            status="started",
+            model_name=request.model_name
+        )
+    
+    except Exception as e:
+        logger.error(f"Error starting training: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error starting training: {str(e)}")
+
+async def train_model_background(training_id: str, model_name: str):
+    """
+    Train the model in the background.
+    
+    Args:
+        training_id: Training job ID
+        model_name: Model name to train
+    """
+    try:
+        # Update status
+        _update_training_status(training_id, "preparing")
+        
+        # Prepare dataset
+        train_data, eval_data = data_handler.prepare_document_training_data(
+            documents_path="data/processed/documents",
+            questions_path="data/training/questions.json"
+        )
+        
+        # Initialize training components
+        from docuchat.training.rl_trainer import GRPOTrainer
+        import torch
+        
+        # Prepare model for training
+        train_model = model_loader.prepare_model_for_training()
+        
+        # Create trainer
+        trainer = GRPOTrainer(
+            model=train_model,
+            tokenizer=tokenizer,
+            reward_model=reward_model,
+            output_dir=f"data/trained_models/{training_id}"
+        )
+        
+        # Update status
+        _update_training_status(training_id, "training")
+        
+        # Create optimizer
+        optimizer = torch.optim.AdamW(
+            train_model.parameters(),
+            lr=config['rl']['training']['learning_rate']
+        )
+        
+        # Create learning rate scheduler
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=config['rl']['training']['max_steps']
+        )
+        
+        # Train the model
+        metrics = trainer.train(train_data, optimizer, scheduler)
+        
+        # Update status with metrics
+        _update_training_status(training_id, "completed", metrics)
+        
+        logger.info(f"Training {training_id} completed successfully")
+    
+    except Exception as e:
+        logger.error(f"Error during training {training_id}: {str(e)}")
+        _update_training_status(training_id, "failed", {"error": str(e)})
+
+def _update_training_status(training_id: str, status: str, metrics: Optional[Dict[str, Any]] = None):
+    """
+    Update training job status.
+    
+    Args:
+        training_id: Training job ID
+        status: New status
+        metrics: Optional metrics
+    """
+    status_dir = "data/training/status"
+    os.makedirs(status_dir, exist_ok=True)
+    
+    status_file = os.path.join(status_dir, f"{training_id}.json")
+    
+    with open(status_file, 'w') as f:
+        json.dump({
+            "training_id": training_id,
+            "status": status,
+            "timestamp": datetime.now().isoformat(),
+            "metrics": metrics or {}
+        }, f, indent=2)
+
+@app.get("/train/{training_id}", response_model=Dict[str, Any])
+async def get_training_status(training_id: str):
+    """
+    Get the status of a training job.
+    
+    Args:
+        training_id: Training job ID
+        
+    Returns:
+        Training job status
+    """
+    status_file = f"data/training/status/{training_id}.json"
+    
+    if not os.path.exists(status_file):
+        raise HTTPException(status_code=404, detail=f"Training job {training_id} not found")
+    
+    try:
+        with open(status_file, 'r') as f:
+            status = json.load(f)
+        
+        return status
+    
+    except Exception as e:
+        logger.error(f"Error loading training status for {training_id}: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error loading training status: {str(e)}")

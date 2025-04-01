@@ -1,0 +1,83 @@
+# Model Configuration
+model:
+  # Base model for inference
+  base_model_name: "TinyLlama/TinyLlama-1.1B-Chat-v1.0"  # Choose a small model for efficiency
+  embedding_model: "BAAI/bge-small-en-v1.5"
+  # Model loading settings
+  device: "auto"  # "auto", "cuda", "cpu", "mps"
+  load_in_8bit: true
+  load_in_4bit: false
+  use_flash_attention: true
+  max_context_length: 3584
+  max_new_tokens: 1024
+  temperature: 0.7
+  top_p: 0.9
+
+# Document processing
+documents:
+  processor:
+    chunk_size: 512
+    chunk_overlap: 128
+    supported_file_types:
+      - "pdf"
+      - "txt"
+      - "docx"
+      - "md"
+  embedding:
+    dimensions: 384
+    normalize: true
+    vector_store_path: "./data/processed/vector_store"
+
+# Retrieval settings
+retrieval:
+  top_k: 5
+  similarity_threshold: 0.7
+  reranker_enabled: false
+  reranker_model: "cross-encoder/ms-marco-MiniLM-L-6-v2"
+
+# Reinforcement Learning settings
+rl:
+  algorithm: "grpo"  # Group Relative Policy Optimization
+  training:
+    per_device_train_batch_size: 6
+    learning_rate: 1.0e-6
+    num_train_epochs: 1
+    max_steps: 500
+    warmup_ratio: 0.1
+    lr_scheduler_type: "cosine_with_restarts"
+    gradient_accumulation_steps: 4
+    gradient_checkpointing: true
+    use_peft: true  # Parameter-Efficient Fine-Tuning
+  rewards:
+    accuracy_weight: 2.0
+    format_weight: 1.0
+    cosine_weight: 1.0  # For length control
+  generation:
+    num_generations: 6
+    temperature: 0.7
+
+# UI settings
+ui:
+  theme: "light"  # "light" or "dark"
+  page_title: "DocuChat - Document-Based LLM with RL"
+  port: 8501
+  debug: false
+
+# API settings
+api:
+  host: "0.0.0.0"
+  port: 8000
+  debug: false
+  cors_origin: "*"
+
+# Logging
+logging:
+  level: "INFO"  # DEBUG, INFO, WARNING, ERROR, CRITICAL
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  file: "./logs/docuchat.log"
+
+# Weights & Biases integration
+wandb:
+  enabled: false
+  project: "docuchat"
+  entity: "your_entity"
